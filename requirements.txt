@@ -1,0 +1,7 @@
+numpy
+torch
+scikit-learn
+h5py
+tqdm
+tensorboard
+matplotlib
