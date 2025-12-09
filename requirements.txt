@@ -5,3 +5,5 @@ h5py
 tqdm
 tensorboard
 matplotlib
+torchmetrics
+torchinfo
