@@ -1,0 +1,10 @@
+Unknown Detection Results
+=========================
+Method: combined
+Strictness: high
+
+Metrics:
+overall_accuracy: 0.5140
+known_accuracy: 1.0000
+unknown_recall: 0.0000
+false_positive_rate: 0.0000
