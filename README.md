@@ -8,6 +8,11 @@
 python train.py  
 ```
 
+**Tensorboard** :
+```bash
+tensorboard --logdir=runs
+```
+
 **Test sans anomalies** : 
 ```bash
 python test.py --checkpoint runs\20251209-160344_run\checkpoint.pt --test Data\test.hdf5  
