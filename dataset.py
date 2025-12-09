@@ -6,10 +6,11 @@ import torch
 import math
 
 class SignalsDataset(Dataset):
-    def __init__(self, path_to_data: list[str] | str, transform=None, magnitude_only=True, window_size=256, exclude_zero_snr=False, only_one_snr=-1, augment=True):
+    def __init__(self, path_to_data, transform=None, magnitude_only=True, window_size=256, augment=True):
         """
-        Dataset PyTorch for signalsfrom a HDF5 file.
-        we keep labels in int8, snr in int16.
+        Dataset flexible :
+        - Si transform=None : Renvoie (3, L) -> I, Q, Amplitude
+        - Si transform="stft" : Renvoie (1, F, T) -> Spectrogramme
         """
         super().__init__()
         self.paths = path_to_data
@@ -18,93 +19,90 @@ class SignalsDataset(Dataset):
         self.nfft = window_size
         self.augment = augment
 
-        if isinstance(path_to_data, list):
-            self.signals = []
-            self.labels = []
-            self.snr = []
-            for path in path_to_data:
-                with h5py.File(path, "r") as f:
-                    self.signals.append(np.array(f["signaux"], dtype=np.float32))  # (N, 2, L)
-                    self.labels.append(np.array(f["labels"], dtype=np.int8))  # (N,)
-                    self.snr.append(np.array(f["snr"], dtype=np.int16))  # (N,)
-            self.signals = np.concatenate(self.signals, axis=0)
-            self.labels = np.concatenate(self.labels, axis=0)
-            self.snr =  np.concatenate(self.snr, axis=0)
-        else:
-            with h5py.File(self.paths, "r") as f:
-                self.signals = np.array(f["signaux"], dtype=np.float32)  # (N, 2, L)
-                self.labels = np.array(f["labels"], dtype=np.int8)  # (N,)
-                self.snr = np.array(f["snr"], dtype=np.int16)  # (N,)
+        # Chargement (gestion liste ou str)
+        if isinstance(path_to_data, str):
+            path_to_data = [path_to_data]
+            
+        self.signals = []
+        self.labels = []
+        self.snr = []
         
-        if only_one_snr != -1:
-            mask = self.snr == only_one_snr
-            before = len(self.snr)
-            self.signals = self.signals[mask]
-            self.labels = self.labels[mask]
-            self.snr = self.snr[mask]
-            print(f"Filtered dataset to only include SNR = {only_one_snr}, kept {len(self.snr)} samples out of {before}")
+        for path in path_to_data:
+            with h5py.File(path, "r") as f:
+                self.signals.append(np.array(f["signaux"], dtype=np.float32))
+                self.labels.append(np.array(f["labels"], dtype=np.int8))
+                self.snr.append(np.array(f["snr"], dtype=np.int16))
+                
+        self.signals = np.concatenate(self.signals, axis=0)
+        self.labels = np.concatenate(self.labels, axis=0)
+        self.snr = np.concatenate(self.snr, axis=0)
 
-        if exclude_zero_snr:
-            mask = self.snr != 0
-            before = len(self.snr)
-            self.signals = self.signals[mask]
-            self.labels = self.labels[mask]
-            self.snr = self.snr[mask]
-            print(f"Removed {before - len(self.snr)} samples with SNR = 0")
-        print(
-            f"Dataset loaded: {len(self.signals)} samples, each of shape {self.signals[0].shape}"
-        )
+        print(f"Dataset loaded: {len(self.signals)} samples.")
 
     def __len__(self):
         return len(self.signals)
 
     def __getitem__(self, idx):
-        signal = self.signals[idx]  # (2, L)
-        label = self.labels[idx]  # int8
-        snr = self.snr[idx]  # int16
+        # 1. Récupération Brute (2, L)
+        signal = self.signals[idx] # (N, 2, L) -> ici (2, L) stocké souvent comme (N, L, 2) ou (N, 2, L)
+        # Vérifions la shape. Le fichier HDF5 donne souvent (N, 2, L) ou (N, L, 2).
+        # Dans le TP standard : (N, 2, L) -> signal est (2, L)
+        
+        signal = torch.tensor(signal, dtype=torch.float32)
+        
+        # Si shape est (L, 2), on transpose
+        if signal.shape[0] != 2 and signal.shape[1] == 2:
+            signal = signal.transpose(0, 1) # (2, L)
 
-        # Convertir en Tensor
-        signal = torch.tensor(signal, dtype=torch.float32).transpose(
-            -1, -2
-        )  # (L, 2) -> (2, L)
+        label = torch.tensor(self.labels[idx], dtype=torch.int8)
+        snr = torch.tensor(self.snr[idx], dtype=torch.float32)
+
+        # 2. Augmentation (Rotation de phase) - Seulement sur I/Q
         if self.augment:
-            signal = random_rotate_iq(signal) # Data augmentation: random IQ rotation
-            
-            # SNR-based noise augmentation
-            if torch.rand(1).item() < 0.5:
-                if snr.item() == 30:
-                    new_snr = torch.tensor(np.random.choice([20, 10, 0]), dtype=torch.float32)
-                    signal = add_noise_to_snr(signal, snr.item(), new_snr.item())
-                    snr = new_snr
-                elif snr.item() == 20:
-                    new_snr = torch.tensor(np.random.choice([10, 0]), dtype=torch.float32)
-                    signal = add_noise_to_snr(signal, snr.item(), new_snr.item())
-                    snr = new_snr
-                elif snr.item() == 10:
-                    new_snr = torch.tensor(0, dtype=torch.float32)
-                    signal = add_noise_to_snr(signal, snr.item(), new_snr.item())
-                    snr = new_snr
+            angle = 2 * math.pi * torch.rand(1).item()
+            I, Q = signal[0], signal[1]
+            cos_a, sin_a = math.cos(angle), math.sin(angle)
+            I_rot = I * cos_a - Q * sin_a
+            Q_rot = I * sin_a + Q * cos_a
+            signal = torch.stack([I_rot, Q_rot], dim=0)
 
+        # ---------------------------------------------------------
+        # CAS 1 : SPECTROGRAMME (STFT)
+        # ---------------------------------------------------------
         if self.transform == "stft":
+            # On forme un signal complexe pour la STFT : I + jQ
+            complex_signal = torch.complex(signal[0], signal[1]) # (L,)
+            
+            # Calcul STFT
             spec = torch.stft(
-                signal,
+                complex_signal,
                 n_fft=self.nfft,
-                hop_length=self.nfft//2,
+                hop_length=self.nfft // 2,
                 win_length=self.nfft,
                 window=torch.hann_window(self.nfft, device=signal.device),
                 return_complex=True,
-            )  # (C, F, T)
+                center=False # Pour éviter le padding excessif
+            ) # Résultat : (Freq, Time) complexe
+            
             if self.magnitude_only:
-                signal = torch.abs(spec)  # (C, F, T)
+                spec = torch.abs(spec) # (Freq, Time) magnitude
+                # Ajout dimension canal pour le CNN 2D : (1, F, T)
+                signal = spec.unsqueeze(0)
             else:
-                spec = torch.view_as_real(spec)  # (C, F, T, 2)
-                spec = spec.permute(0, 2, 1, 3).contiguous()
-                signal = spec.view(spec.size(0), spec.size(1), -1)
-        label = torch.tensor(label, dtype=torch.int8)  # keep it as int8
-        snr = torch.tensor(snr, dtype=torch.float32)  # float32 for model input
+                # Si on voulait garder la phase (optionnel)
+                signal = torch.view_as_real(spec).permute(2, 0, 1)
+
+        # ---------------------------------------------------------
+        # CAS 2 : TEMPOREL (I, Q, Amplitude)
+        # ---------------------------------------------------------
+        else:
+            # Calcul de l'amplitude
+            amp = torch.sqrt(signal[0]**2 + signal[1]**2)
+            # Stack pour avoir (3, L)
+            signal = torch.cat([signal, amp.unsqueeze(0)], dim=0)
 
         return signal, label, snr
-
+    
 
 def rotate_iq(signal, angle_rad):
     """

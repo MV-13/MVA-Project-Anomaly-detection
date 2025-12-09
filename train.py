@@ -1,307 +1,211 @@
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader
-import numpy as np
-from sklearn.metrics import precision_score, recall_score, confusion_matrix
-import h5py
-from tqdm import tqdm
-from torch.utils.tensorboard import SummaryWriter
+import argparse
 import os
-from datetime import datetime
+import time
 
-train_path = 'Data/train.hdf5'
-#train_path = 'Data/samples.hdf5'
-test_path = 'Data/test_anomalies.hdf5'
+import torch
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+from torchinfo import summary
 
-timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-final_run_name = f"{timestamp}_run"
-
-# Modèle simple CNN 1D
-class SimpleSignalClassifier(nn.Module):
-    def __init__(self, num_classes=6):
-        super().__init__()
-        self.features = nn.Sequential(
-            # (2, L) -> (32, L/2)
-            nn.Conv1d(2, 32, kernel_size=7, stride=2, padding=3),
-            nn.BatchNorm1d(32),
-            nn.ReLU(),
-            
-            # (32, L/2) -> (64, L/4)
-            nn.Conv1d(32, 64, kernel_size=5, stride=2, padding=2),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            
-            # (64, L/4) -> (128, L/8)
-            nn.Conv1d(64, 128, kernel_size=5, stride=2, padding=2),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            
-            # (128, L/8) -> (128, L/16)
-            nn.Conv1d(128, 128, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-        )
-        
-        self.global_pool = nn.AdaptiveAvgPool1d(1)
-        self.classifier = nn.Linear(128, num_classes)
-        
-    def forward(self, x):
-        # x: (B, 2, L)
-        x = self.features(x)
-        x = self.global_pool(x)  # (B, 128, 1)
-        x = x.squeeze(-1)  # (B, 128)
-        logits = self.classifier(x)
-        return logits
-    
-    def get_features(self, x):
-        """Extrait les features pour la détection d'anomalies"""
-        x = self.features(x)
-        x = self.global_pool(x)
-        x = x.squeeze(-1)
-        return x
+from dataset import SignalsDataset
+from models import DumpSignalModel, CNN_LSTM_SNR_Model, STFT_CNN_LSTM_SNR_Model
 
 
-def train_epoch(model, dataloader, criterion, optimizer, device, writer=None, epoch=0):
-    model.train()
+def save_checkpoint(model, optimizer, epoch, loss, path):
+    torch.save(
+        {
+            "epoch": epoch,
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "loss": loss,
+        },
+        path,
+    )
+    print(f"Checkpoint saved at epoch {epoch+1} → {path}")
+
+
+def validate(model, dataloader, device, loss_fn):
+    model.eval()
     total_loss = 0
     correct = 0
-    total = 0
-    
-    for batch_idx, (signals, labels, snr) in enumerate(tqdm(dataloader, desc="Training")):
-        signals = signals.to(device)
-        labels = labels.to(device).long()
-        
-        optimizer.zero_grad()
-        outputs = model(signals)
-        loss = criterion(outputs, labels)
-        
-        loss.backward()
-        optimizer.step()
-        
-        total_loss += loss.item()
-        _, predicted = outputs.max(1)
-        total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
-        
-        # Log batch metrics to TensorBoard
-        if writer is not None and batch_idx % 10 == 0:
-            global_step = epoch * len(dataloader) + batch_idx
-            writer.add_scalar('Train/BatchLoss', loss.item(), global_step)
-            batch_acc = 100. * predicted.eq(labels).sum().item() / labels.size(0)
-            writer.add_scalar('Train/BatchAccuracy', batch_acc, global_step)
-    
-    return total_loss / len(dataloader), 100. * correct / total
+    n = 0
 
+    snr_correct = {}
+    snr_total = {}
 
-def evaluate(model, dataloader, device):
-    model.eval()
-    correct = 0
-    total = 0
-    
     with torch.no_grad():
         for signals, labels, snr in dataloader:
             signals = signals.to(device)
-            labels = labels.to(device).long()
-            
-            outputs = model(signals)
-            _, predicted = outputs.max(1)
-            total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
-    
-    return 100. * correct / total
+            labels = labels.to(device)
+            snr = snr.to(device).unsqueeze(1)  # shape [B,1]
 
+            outputs = model(signals, snr)
+            loss = loss_fn(outputs, labels.long())
+            total_loss += loss.item() * signals.size(0)
 
-def detect_anomalies(model, dataloader, device, threshold=0.5):
-    """
-    Détecte les anomalies en utilisant la confiance maximale du softmax.
-    Si max(softmax) < threshold, le signal est considéré comme anomalie.
-    """
-    model.eval()
-    predictions = []
-    true_labels = []
-    confidences = []
-    
-    with torch.no_grad():
-        for signals, labels, snr in dataloader:
-            signals = signals.to(device)
-            labels = labels.cpu().numpy()
-            
-            outputs = model(signals)
-            probs = torch.softmax(outputs, dim=1)
-            max_probs, _ = probs.max(dim=1)
-            
-            # Prédiction binaire : 0 si connu (confiance haute), 1 si anomalie (confiance basse)
-            pred_binary = (max_probs < threshold).cpu().numpy().astype(int)
-            
-            # Vérité terrain binaire : 0 si classe 0-5, 1 si classe 6-8
-            true_binary = (labels >= 6).astype(int)
-            
-            predictions.extend(pred_binary)
-            true_labels.extend(true_binary)
-            confidences.extend(max_probs.cpu().numpy())
-    
-    predictions = np.array(predictions)
-    true_labels = np.array(true_labels)
-    confidences = np.array(confidences)
-    
-    return predictions, true_labels, confidences
+            preds = torch.argmax(outputs, dim=1)
+            correct += (preds == labels).sum().item()
+            n += labels.size(0)
 
+            # Track per-SNR accuracy
+            for s, p, l in zip(snr, preds, labels):
+                s = int(s.item())
+                if s not in snr_correct:
+                    snr_correct[s] = 0
+                    snr_total[s] = 0
+                snr_correct[s] += (p == l).item()
+                snr_total[s] += 1
 
-def find_best_threshold(model, dataloader, device):
-    """Trouve le meilleur seuil en maximisant le F1-score"""
-    model.eval()
-    confidences = []
-    true_labels = []
-    
-    with torch.no_grad():
-        for signals, labels, snr in dataloader:
-            signals = signals.to(device)
-            labels = labels.cpu().numpy()
-            
-            outputs = model(signals)
-            probs = torch.softmax(outputs, dim=1)
-            max_probs, _ = probs.max(dim=1)
-            
-            true_binary = (labels >= 6).astype(int)
-            
-            confidences.extend(max_probs.cpu().numpy())
-            true_labels.extend(true_binary)
-    
-    confidences = np.array(confidences)
-    true_labels = np.array(true_labels)
-    
-    # Tester différents seuils
-    thresholds = np.linspace(0.3, 0.95, 50)
-    best_f1 = 0
-    best_threshold = 0.5
-    
-    for thresh in thresholds:
-        pred_binary = (confidences < thresh).astype(int)
-        precision = precision_score(true_labels, pred_binary, zero_division=0)
-        recall = recall_score(true_labels, pred_binary, zero_division=0)
-        f1 = 2 * (precision * recall) / (precision + recall + 1e-10)
-        
-        if f1 > best_f1:
-            best_f1 = f1
-            best_threshold = thresh
-    
-    print(f"Meilleur seuil trouvé: {best_threshold:.4f} (F1={best_f1:.4f})")
-    return best_threshold
+    avg_loss = total_loss / n
+    accuracy = correct / n
+
+    # Compute per-SNR accuracy
+    snr_acc = {s: snr_correct[s] / snr_total[s] for s in snr_correct}
+
+    model.train()
+    return avg_loss, accuracy, snr_acc
+
 
 
 def main():
-    # Configuration
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Utilisation de: {device}")
+    batch_size = 512
+    n_epochs = 500
+    train_paths = ["Data/train.hdf5", "Data/samples.hdf5"]
+    val_path = "Data/validation.hdf5"
+    
+    # STFT parameters
+    transform = None  # None or "stft"
+    window_size = 256
+    magnitude_only: bool = True 
+    
+    # Data filtering options
+    exclude_zero_snr: bool = False
+    only_one_snr: int = -1 # -1 to include all, or snr in {0, 10, 20, 30}
+    include_snr: bool = True  # Whether to provide SNR as input to the model
+    augment: bool = True  # Whether to apply data augmentation
 
-    # Charger les données d'entraînement
-    from dataset import SignalsDataset  # Assurez-vous que le fichier est accessible
-
-    train_dataset = SignalsDataset(
-        path_to_data= train_path,
-        transform=None,  # Pas de STFT
-        augment=False    # Pas d'augmentation
+    # ----------------------------
+    # Parse CLI arguments
+    # ----------------------------
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--name", type=str, default=None, help="Optional name added to the run folder"
     )
+    parser.add_argument(
+        "--load", type=str, default=None,
+        help="Path to a checkpoint to load (absolute or relative)"
+    )
+    args = parser.parse_args()
 
-    train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True, num_workers=0)  # num_workers=0 pour Windows
+    # ----------------------------
+    # Build run name
+    # ----------------------------
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
 
-    # Créer le modèle
-    model = SimpleSignalClassifier(num_classes=6).to(device)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3)
+    if args.name is None:
+        final_run_name = f"{timestamp}_run"
+    else:
+        final_run_name = f"{timestamp}_{args.name}"
 
-    # Log du graphe du modèle
     log_dir = os.path.join("runs", final_run_name)
     os.makedirs(log_dir, exist_ok=True)
 
     writer = SummaryWriter(log_dir=log_dir)
+    ckpt_path = os.path.join(log_dir, "checkpoint.pt")
+    print(f"Logging to {log_dir}")
 
-    dummy_input = torch.randn(1, 2, 1024).to(device)
-    writer.add_graph(model, dummy_input)
+    # Load datasets
+    train_dataset = SignalsDataset(train_paths, transform, magnitude_only=magnitude_only, window_size=window_size, exclude_zero_snr=exclude_zero_snr, only_one_snr=only_one_snr, augment=augment)
+    val_dataset = SignalsDataset(val_path, transform, magnitude_only=magnitude_only, window_size=window_size, exclude_zero_snr=exclude_zero_snr, only_one_snr=only_one_snr, augment=False)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
+    # Build model
+    model = CNN_LSTM_SNR_Model(n_classes=6, n_channels=2, hidden_size=64, include_snr=include_snr)
+    print(f"Model has {sum([p.numel() for p in model.parameters()]):,} parameters")
+    model.train()
 
-    # Entraînement
-    num_epochs = 30
-    best_acc = 0
+    # ----------------------------
+    # Load checkpoint if provided
+    # ----------------------------
+    if args.load is not None:
+        ckpt_path_load = os.path.abspath(args.load)
+        print(f"Loading checkpoint from: {ckpt_path_load}")
 
-    print("\n=== Entraînement du modèle ===")
-    for epoch in range(num_epochs):
-        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device, writer, epoch)
-        
-        print(f"Epoch {epoch+1}/{num_epochs}")
-        print(f"  Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
-        
-        # Log des métriques d'epoch
-        writer.add_scalar('Epoch/Loss', train_loss, epoch)
-        writer.add_scalar('Epoch/Accuracy', train_acc, epoch)
-        writer.add_scalar('Epoch/LearningRate', optimizer.param_groups[0]['lr'], epoch)
-        
-        scheduler.step(train_acc)
-        
-        if train_acc > best_acc:
-            best_acc = train_acc
-            torch.save(model.state_dict(), 'best_model.pth')
-            print(f"  ✓ Nouveau meilleur modèle sauvegardé!")
-            writer.add_scalar('Epoch/BestAccuracy', best_acc, epoch)
+        if not os.path.isfile(ckpt_path_load):
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path_load}")
 
-    # Charger le meilleur modèle
-    model.load_state_dict(torch.load('best_model.pth'))
-    print(f"\nMeilleure précision d'entraînement: {best_acc:.2f}%")
+        checkpoint = torch.load(ckpt_path_load, map_location=device)
 
-    # Test avec détection d'anomalies
-    print("\n=== Test - Détection d'anomalies ===")
-    test_dataset = SignalsDataset(
-        path_to_data= test_path,
-        transform=None,
-        augment=False
-    )
-    test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False, num_workers=0)  # num_workers=0 pour Windows
+        model.load_state_dict(checkpoint["model_state"])
+        print(f"Loaded model weights from epoch {checkpoint['epoch']+1}")
+    else:
+        checkpoint = None
 
-    # Trouver le meilleur seuil
-    best_threshold = find_best_threshold(model, test_loader, device)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    model.to(device)
 
-    # Évaluer avec le meilleur seuil
-    predictions, true_labels, confidences = detect_anomalies(model, test_loader, device, threshold=best_threshold)
+    loss_fn = torch.nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters())
 
-    # Calcul des métriques
-    precision = precision_score(true_labels, predictions)
-    recall = recall_score(true_labels, predictions)
-    f1 = 2 * (precision * recall) / (precision + recall + 1e-10)
+    # If we loaded a checkpoint, restore optimizer state
+    if checkpoint is not None and "optimizer_state" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer_state"])
+        print("Loaded optimizer state")
 
-    print(f"\n=== Résultats finaux (seuil={best_threshold:.4f}) ===")
-    print(f"Précision: {precision:.4f}")
-    print(f"Recall: {recall:.4f}")
-    print(f"F1-Score: {f1:.4f}")
-
-    # Matrice de confusion
-    cm = confusion_matrix(true_labels, predictions)
-    print(f"\nMatrice de confusion:")
-    print(f"                Prédit: Normal  Prédit: Anomalie")
-    print(f"Vrai: Normal       {cm[0,0]:6d}       {cm[0,1]:6d}")
-    print(f"Vrai: Anomalie     {cm[1,0]:6d}       {cm[1,1]:6d}")
-
-    # Statistiques par classe
-    print("\n=== Analyse par classe ===")
-    with torch.no_grad():
-        for signals, labels, snr in test_loader:
+    # ----------------------------
+    # Training Loop
+    # ----------------------------
+    for epoch in range(n_epochs):
+        step = 0
+        for signals, labels, snr in train_loader:
             signals = signals.to(device)
-            labels_np = labels.cpu().numpy()
-            
-            outputs = model(signals)
-            probs = torch.softmax(outputs, dim=1)
-            max_probs, _ = probs.max(dim=1)
-            max_probs_np = max_probs.cpu().numpy()
-            
-            for class_id in range(9):
-                mask = labels_np == class_id
-                if mask.sum() > 0:
-                    avg_conf = max_probs_np[mask].mean()
-                    std_conf = max_probs_np[mask].std()
-                    is_anomaly = "ANOMALIE" if class_id >= 6 else "NORMALE"
-                    print(f"Classe {class_id} ({is_anomaly}): confiance moy={avg_conf:.4f} ± {std_conf:.4f}")
-            break  # Une seule passe suffit
+            labels = labels.to(device)
+            snr = snr.to(device).unsqueeze(1)  # shape [B,1]
+
+            outputs = model(signals, snr)
+            loss_value = loss_fn(outputs, labels.long())
+
+            optimizer.zero_grad()
+            loss_value.backward()
+            optimizer.step()
+            writer.add_scalar(
+                "Loss/train_step", loss_value.item(), step + epoch * len(train_loader)
+            )
+            step += 1
+
+        # Compute validation metrics
+        val_loss, val_acc, snr_acc = validate(model, val_loader, device, loss_fn)
+
+        # Logging
+        writer.add_scalar("Loss/train", loss_value.item(), epoch)
+        writer.add_scalar("Loss/val", val_loss, epoch)
+        writer.add_scalar("Accuracy/val", val_acc, epoch)
+
+        # Log per-SNR accuracy
+        for s, acc in snr_acc.items():
+            writer.add_scalar(f"Accuracy/val_SNR_{s}dB", acc, epoch)
+
+        if (epoch + 1) % 10 == 0:
+            snr_acc_str = " | ".join([f"SNR={s}dB:{acc:.3f}" for s, acc in snr_acc.items()])
+            print(
+                f"[{epoch+1}/{n_epochs}] "
+                f"train_loss={loss_value.item():.4f} | "
+                f"val_loss={val_loss:.4f} | val_acc={val_acc:.4f} | {snr_acc_str}"
+            )
+
+        # -------------------------
+        # Save checkpoint every 50 epochs
+        # -------------------------
+        if (epoch + 1) % 50 == 0:
+            ckpt_path_epoch = os.path.join(log_dir, f"checkpoint_epoch{epoch+1}.pt")
+            save_checkpoint(model, optimizer, epoch, loss_value.item(), ckpt_path_epoch)
+            print(f"Saved checkpoint at epoch {epoch+1}: {ckpt_path_epoch}")
+
+    # Save final checkpoint
+    save_checkpoint(model, optimizer, n_epochs - 1, loss_value.item(), path=ckpt_path)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
