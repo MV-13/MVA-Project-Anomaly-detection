@@ -224,14 +224,6 @@ La confiance (probabilité softmax maximale) apporte une information complément
 - **C1, C4** : Bien séparées → seuil bas (0.20-0.35)
 - **C3, C5** : Confondues avec les variantes → seuil haut (0.45-0.75)
 
-```python
-# Décision avec seuil adaptatif
-if score < threshold[predicted_class]:
-    return "INCONNU"
-else:
-    return predicted_class
-```
-
 ### Utilisation du détecteur
 
 ```bash
