@@ -10,10 +10,10 @@
 2. [Installation](#installation)
 3. [Structure du projet](#structure-du-projet)
 4. [Partie 1 : Classification des signaux IQ](#partie-1--classification-des-signaux-iq)
-5. [Partie 2 : Détection d'anomalies (OOD)](#partie-2--détection-danomalies-ood)
-6. [Résultats](#résultats)
-7. [Utilisation rapide](#utilisation-rapide)
-
+5. [Analyse exploratoire des données](#analyse-exploratoire-des-données)
+6. [Partie 2 : Détection d'anomalies (OOD)](#partie-2--détection-danomalies-ood)
+7. [Résultats](#résultats)
+8. [Utilisation rapide](#utilisation-rapide)
 ---
 
 ## Description du projet
@@ -68,6 +68,7 @@ pip install -r requirements.txt
 ├── dataset.py               # Gestion des données
 ├── train_classifier.py      # Script d'entraînement du classifieur
 ├── test_classifier.py       # Script de test du classifieur
+├── analyze_data.py          # Analyse exploratoire des données
 ├── anomaly_detector.py      # Détecteur d'anomalies OOD
 └── README.md
 ```
@@ -132,6 +133,48 @@ python test_classifier.py --checkpoint runs/20251209-160344_run/checkpoint.pt --
 - Graphique Accuracy vs SNR
 
 ---
+
+## Analyse exploratoire des données
+
+Avant de développer le détecteur d'anomalies, nous avons analysé les données pour comprendre pourquoi les classes inconnues (6-8) ressemblent aux classes connues (3-5).
+
+### Utilisation
+
+```bash
+python analyze_data.py \
+    --classifier runs/20251209-160344_run/checkpoint.pt \
+    --test Data/test_anomalies.hdf5 \
+    --save_dir analysis_results
+```
+
+### Analyses effectuées
+
+1. **Statistiques des signaux** (`signal_statistics.png`)
+   - Amplitude moyenne et écart-type
+   - Puissance du signal
+   - Variation de phase
+   - Corrélation I-Q
+   - **Résultat** : Les classes inconnues ont des statistiques quasi-identiques aux classes connues
+
+2. **Analyse fréquentielle** (`frequency_analysis.png`)
+   - Spectre moyen par classe
+   - Comparaison C3/C5 vs classes inconnues
+   - **Résultat** : Les spectres sont très similaires
+
+3. **Visualisation des embeddings** (`tsne_embeddings.png`, `pca_embeddings.png`)
+   - Projection t-SNE et PCA des features CNN
+   - **Résultat** : Les inconnus forment des clusters **distincts mais proches** des connus
+
+4. **Analyse de confusion** (`unknown_probabilities.png`)
+   - Distribution des probabilités softmax pour les classes inconnues
+   - Vers quelle classe connue chaque inconnu est classifié
+
+### Insight principal
+
+> Les classes inconnues ne sont pas à la périphérie de l'espace des features, mais forment des clusters légèrement décalés. C'est pourquoi les approches classiques (seuil de confiance, distance au centroïde) échouent, et pourquoi l'approche k-NN fonctionne.
+
+---
+
 
 ## Partie 2 : Détection d'anomalies (OOD)
 
@@ -251,7 +294,14 @@ python test_classifier.py \
     --test Data/test.hdf5
 ```
 
-### 3. Détecter les anomalies
+### 3. Analyser les données (optionnel)
+
+```bash
+python analyze_data.py \
+    --classifier runs//checkpoint.pt --test Data/test_anomalies.hdf5 --save_dir analysis_results
+```
+
+### 4. Détecter les anomalies
 ```bash
 python anomaly_detector.py \
     --classifier runs/<run_name>/checkpoint.pt \
@@ -260,7 +310,7 @@ python anomaly_detector.py \
     --save_dir results
 ```
 
-### 4. Visualiser l'entraînement
+### 5. Visualiser l'entraînement
 ```bash
 tensorboard --logdir=runs
 ```
